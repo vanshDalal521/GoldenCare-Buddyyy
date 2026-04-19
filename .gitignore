@@ -1,0 +1,14 @@
+node_modules/
+.DS_Store
+.env
+*.log
+mongodb_data/
+.venv/
+.qoder/
+dist/
+build/
+.next/
+.vscode/
+.idea/
+*.swp
+*.swo

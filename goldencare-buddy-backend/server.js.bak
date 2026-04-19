@@ -1,0 +1,563 @@
+import express from 'express';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Import services
+import schedulerService from './services/schedulerService.js';
+import twilioService from './services/twilioService.js';
+
+// Import models
+import Patient from './models/Patient.js';
+import Medication from './models/Medication.js';
+import CallLog from './models/CallLog.js';
+
+// Load environment variables
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Middleware
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true
+}));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Serve static audio files
+app.use('/audio', express.static(path.join(__dirname, 'public/audio')));
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/goldencare-buddy', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => {
+  console.log('✅ Connected to MongoDB');
+  // Start scheduler after DB connection
+  schedulerService.start();
+})
+.catch(err => {
+  console.error('❌ MongoDB connection error:', err);
+  process.exit(1);
+});
+
+// ==================== PATIENT ROUTES ====================
+
+/**
+ * Register new patient
+ */
+app.post('/api/patients/register', async (req, res) => {
+  try {
+    const { name, patientId, password, mobile, countryCode } = req.body;
+
+    // Validation
+    if (!name || !patientId || !password || !mobile) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide all required fields: name, patientId, password, mobile'
+      });
+    }
+
+    // Check if patient already exists
+    const existingPatient = await Patient.findOne({ patientId });
+    if (existingPatient) {
+      return res.status(409).json({
+        success: false,
+        message: 'Patient ID already exists'
+      });
+    }
+
+    // Create new patient
+    const patient = new Patient({
+      name,
+      patientId,
+      password, // In production, hash this!
+      mobile,
+      countryCode: countryCode || '+91'
+    });
+
+    await patient.save();
+
+    console.log(`✅ New patient registered: ${name} (${patientId})`);
+
+    res.status(201).json({
+      success: true,
+      message: 'Patient registered successfully',
+      patient: {
+        id: patient._id,
+        name: patient.name,
+        patientId: patient.patientId,
+        mobile: patient.mobile,
+        fullMobile: patient.fullMobile
+      }
+    });
+  } catch (error) {
+    console.error('Error registering patient:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error registering patient',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Patient login
+ */
+app.post('/api/patients/login', async (req, res) => {
+  try {
+    const { patientId, password } = req.body;
+
+    // Find patient by patientId
+    const patient = await Patient.findOne({ patientId });
+    
+    if (!patient) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    // Compare password using bcrypt
+    const isMatch = await patient.comparePassword(password);
+    
+    if (!isMatch) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    // Update last login
+    patient.lastLoginAt = new Date();
+    await patient.save();
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      patient: {
+        id: patient._id,
+        name: patient.name,
+        patientId: patient.patientId,
+        mobile: patient.mobile,
+        fullMobile: patient.fullMobile
+      }
+    });
+  } catch (error) {
+    console.error('Error during login:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Login error',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Get patient's medications
+ */
+app.get('/api/patients/:patientId/medications', async (req, res) => {
+  try {
+    const { patientId } = req.params;
+
+    const patient = await Patient.findOne({ patientId });
+    if (!patient) {
+      return res.status(404).json({
+        success: false,
+        message: 'Patient not found'
+      });
+    }
+
+    const medications = await Medication.find({
+      patient: patient._id,
+      isActive: true
+    }).sort({ customTime: 1 });
+
+    res.json({
+      success: true,
+      medications
+    });
+  } catch (error) {
+    console.error('Error fetching medications:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching medications',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Mark medication as taken
+ */
+app.post('/api/medications/:medicationId/mark-taken', async (req, res) => {
+  try {
+    const { medicationId } = req.params;
+    const { method = 'web', confirmedVia = 'button-click' } = req.body;
+
+    const medication = await Medication.findById(medicationId);
+    
+    if (!medication) {
+      return res.status(404).json({
+        success: false,
+        message: 'Medication not found'
+      });
+    }
+
+    if (medication.isTakenToday()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Medication already taken today'
+      });
+    }
+
+    await medication.markAsTaken(method, confirmedVia);
+
+    res.json({
+      success: true,
+      message: 'Medication marked as taken',
+      medication
+    });
+  } catch (error) {
+    console.error('Error marking medication as taken:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error marking medication as taken',
+      error: error.message
+    });
+  }
+});
+
+// ==================== DOCTOR/ADMIN ROUTES ====================
+
+/**
+ * Add medication for a patient
+ */
+app.post('/api/medications/add', async (req, res) => {
+  try {
+    const {
+      patientId,
+      name,
+      dosage,
+      pillCount,
+      customTime,
+      slot,
+      frequency,
+      notes,
+      prescribedBy
+    } = req.body;
+
+    // Validation
+    if (!patientId || !name || !dosage || !customTime || !slot || !prescribedBy) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    // Find patient
+    const patient = await Patient.findOne({ patientId });
+    if (!patient) {
+      return res.status(404).json({
+        success: false,
+        message: 'Patient not found'
+      });
+    }
+
+    // Create medication
+    const medication = new Medication({
+      patient: patient._id,
+      name,
+      dosage,
+      pillCount: pillCount || 1,
+      customTime,
+      slot,
+      frequency: frequency || 'Once daily',
+      notes,
+      prescribedBy
+    });
+
+    await medication.save();
+
+    console.log(`✅ Medication added: ${name} for ${patient.name} at ${customTime}`);
+
+    res.status(201).json({
+      success: true,
+      message: 'Medication added successfully',
+      medication
+    });
+  } catch (error) {
+    console.error('Error adding medication:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error adding medication',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Update medication
+ */
+app.put('/api/medications/:medicationId', async (req, res) => {
+  try {
+    const { medicationId } = req.params;
+    const updates = req.body;
+
+    const medication = await Medication.findByIdAndUpdate(
+      medicationId,
+      updates,
+      { new: true, runValidators: true }
+    );
+
+    if (!medication) {
+      return res.status(404).json({
+        success: false,
+        message: 'Medication not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Medication updated successfully',
+      medication
+    });
+  } catch (error) {
+    console.error('Error updating medication:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating medication',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Delete medication
+ */
+app.delete('/api/medications/:medicationId', async (req, res) => {
+  try {
+    const { medicationId } = req.params;
+
+    const medication = await Medication.findByIdAndUpdate(
+      medicationId,
+      { isActive: false },
+      { new: true }
+    );
+
+    if (!medication) {
+      return res.status(404).json({
+        success: false,
+        message: 'Medication not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Medication deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting medication:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting medication',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Get all patients (for doctor dashboard)
+ */
+app.get('/api/patients', async (req, res) => {
+  try {
+    const patients = await Patient.find({ isActive: true })
+      .select('-password')
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      patients
+    });
+  } catch (error) {
+    console.error('Error fetching patients:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching patients',
+      error: error.message
+    });
+  }
+});
+
+// ==================== TWILIO WEBHOOKS ====================
+
+/**
+ * TwiML endpoint for medication reminder
+ */
+app.get('/twiml/medication-reminder', (req, res) => {
+  const { audioUrl, medicationId } = req.query;
+  
+  const twiml = twilioService.generateMedicationReminderTwiML(audioUrl, medicationId);
+  
+  res.type('text/xml');
+  res.send(twiml);
+});
+
+/**
+ * Handle patient response (digit pressed)
+ */
+app.post('/api/twilio/handle-response', async (req, res) => {
+  try {
+    const { Digits, CallSid } = req.body;
+    const { medicationId } = req.query;
+
+    const twiml = await twilioService.handlePatientResponse(Digits, medicationId, CallSid);
+    
+    res.type('text/xml');
+    res.send(twiml);
+  } catch (error) {
+    console.error('Error handling Twilio response:', error);
+    res.type('text/xml');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>An error occurred. Please try again later.</Say>
+</Response>`);
+  }
+});
+
+/**
+ * Twilio status callback
+ */
+app.post('/api/twilio/status', async (req, res) => {
+  try {
+    const { CallSid, CallStatus } = req.body;
+    
+    await twilioService.updateCallStatus(CallSid, CallStatus);
+    
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('Error updating call status:', error);
+    res.sendStatus(500);
+  }
+});
+
+// ==================== TESTING/MANUAL TRIGGER ROUTES ====================
+
+/**
+ * Manually trigger a voice call (for testing)
+ */
+app.post('/api/test/trigger-call/:medicationId', async (req, res) => {
+  try {
+    const { medicationId } = req.params;
+    
+    const result = await schedulerService.triggerManualReminder(medicationId);
+    
+    res.json(result);
+  } catch (error) {
+    console.error('Error triggering manual call:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error triggering call',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Get scheduler status
+ */
+app.get('/api/scheduler/status', (req, res) => {
+  const status = schedulerService.getStatus();
+  res.json({
+    success: true,
+    ...status
+  });
+});
+
+/**
+ * Get call logs
+ */
+app.get('/api/call-logs', async (req, res) => {
+  try {
+    const { patientId, limit = 50 } = req.query;
+
+    let query = {};
+    if (patientId) {
+      const patient = await Patient.findOne({ patientId });
+      if (patient) {
+        query.patient = patient._id;
+      }
+    }
+
+    const callLogs = await CallLog.find(query)
+      .populate('patient', 'name patientId mobile')
+      .populate('medication', 'name dosage customTime')
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit));
+
+    res.json({
+      success: true,
+      callLogs
+    });
+  } catch (error) {
+    console.error('Error fetching call logs:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching call logs',
+      error: error.message
+    });
+  }
+});
+
+// ==================== HEALTH CHECK ====================
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    scheduler: schedulerService.getStatus()
+  });
+});
+
+app.get('/', (req, res) => {
+  res.json({
+    message: 'GoldenCare Buddy Backend API',
+    version: '1.0.0',
+    endpoints: {
+      patients: '/api/patients',
+      medications: '/api/medications',
+      callLogs: '/api/call-logs',
+      health: '/health'
+    }
+  });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`\n🚀 GoldenCare Buddy Backend Server`);
+  console.log(`📡 Server running on port ${PORT}`);
+  console.log(`🌐 API URL: http://localhost:${PORT}`);
+  console.log(`🏥 Health Check: http://localhost:${PORT}/health`);
+  console.log(`\n📞 Twilio Status: ${process.env.TWILIO_ACCOUNT_SID ? '✅ Configured' : '⚠️  Not configured (simulation mode)'}`);
+  console.log(`🤖 OpenAI Status: ${process.env.OPENAI_API_KEY ? '✅ Configured' : '⚠️  Not configured'}`);
+  console.log(`\n⏰ Medication Scheduler: ${schedulerService.isRunning ? '✅ Running' : '❌ Stopped'}`);
+  console.log(`\n💡 Ready to make AI voice calls!\n`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  schedulerService.stop();
+  mongoose.connection.close(() => {
+    console.log('MongoDB connection closed');
+    process.exit(0);
+  });
+});
