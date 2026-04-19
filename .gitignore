@@ -3,6 +3,8 @@ node_modules/
 .env
 *.log
 mongodb_data/
+goldencare-buddy-backend/data/
+goldencare-buddy-backend/uploads/
 .venv/
 .qoder/
 dist/
